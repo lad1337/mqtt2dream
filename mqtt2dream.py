@@ -3,32 +3,49 @@
 import socket
 from paho.mqtt.client import Client
 import sys
+import time
 
-client = Client()
-client.connect(sys.argv[1], 8883, 20)
 
 PORT = 8888
-endpoint = (sys.argv[2], PORT)
 
 TOPIC_SET = "dream/set"
 TOPIC_STATUS = "dream/status"
 
 
 # based on https://github.com/genesisfactor/DreamScreenCommander/blob/master/DreamScreenComander.py#L97-L109
-def build_packet(upper, lower, payload):
+def build_packet(upper, lower, payload=None, flags=17, group=0):
+    if payload is None:
+        payload = []
     packet = [
-        0xFC,
-        len(payload) + 5,
-        0,
-        17,
-        upper,
-        lower,
+        0xFC,  # 0: always this
+        len(payload) + 5,  # 1: length
+        group,  # 2: group address, the group number which the device belongs.
+        # 0x00 indicates "No specified Group",
+        # 0x01 indicates group 1, 0x02 indicates group 2,
+        # etc. If the Group Address is incorrect, DreamScreen will discard the message.k
+        flags,  # 3: flags, provides context for handling the message
+        upper,  # 4: command upper, specifies command namespace
+        lower,  # 5: command lower, specifies individual command within namespace
     ]
-    for i in payload:
-        packet.append(i)
+    if payload is not None:
+        for i in payload:
+            packet.append(i)
     packet.append(crc8(packet))
     resp = bytearray(packet)
     return resp
+
+
+def parse_packet(packet):
+    def as_int(p):
+        return int(p.encode('hex'), 16)
+    size = as_int(packet[1])
+    group = as_int(packet[2])
+    flags = as_int(packet[3])
+    upper = as_int(packet[4])
+    lower = as_int(packet[5])
+    crc = packet[-1]
+    payload = [] if size < 5 else packet[6:-1]
+    return upper, lower, payload
 
 
 def on_connect(client, userdata, flags, rc):
@@ -41,7 +58,7 @@ def on_message(client, userdata, message):
     state = 1 if message.payload == 'on' else 0
     packet = build_packet(3, 1, [state])
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(packet, endpoint)
+    sock.sendto(packet, client.endpoint)
     client.publish(TOPIC_STATUS, message.payload)
 
 
@@ -86,8 +103,45 @@ def crc8(packet):
     return crc
 
 
-client.on_connect = on_connect
-client.on_message = on_message
+def get_mode(endpoint):
+    # FC:05:FF:30:01:0A:2A
+    packet = build_packet(1, 0x0A, group=0xFF, flags=0x30)
+    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-while True:
-    client.loop()
+    listen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    listen.bind(("", PORT))
+    mode = -3
+    while mode < 0:
+        out.sendto(packet, endpoint)
+        data, addr = listen.recvfrom(1024)
+        upper, lower, payload = parse_packet(data)
+        if upper == 0x01:
+            mode = int(payload[33].encode('hex'), 16)
+        else:
+            mode += 1
+        time.sleep(1)
+    listen.close()
+    out.close()
+
+    if mode < 0:
+        return None
+    return mode
+
+
+if __name__ == "__main__":
+    client = Client()
+    client.connect(sys.argv[1], 8883, 20)
+    client.endpoint = (sys.argv[2], PORT)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    client.loop_start()
+    while True:
+        mode = get_mode(client.endpoint)
+        status = 'on' if mode else 'standby'
+        print status
+        client.publish(TOPIC_STATUS, status)
+        time.sleep(5)
+
